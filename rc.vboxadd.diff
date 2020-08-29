@@ -1,0 +1,259 @@
+--- VirtualBox-6.1.12.orig/src/VBox/Additions/linux/installer/vboxadd.sh	2020-08-26 01:55:31.913206190 +0800
++++ VirtualBox-6.1.12/src/VBox/Additions/linux/installer/vboxadd.sh	2020-08-26 02:53:03.498468456 +0800
+@@ -121,17 +121,9 @@
+ 
+ dev=/dev/vboxguest
+ userdev=/dev/vboxuser
+-config=/var/lib/VBoxGuestAdditions/config
+ owner=vboxadd
+ group=1
+ 
+-if test -r $config; then
+-  . $config
+-else
+-  fail "Configuration file $config not found"
+-fi
+-test -n "$INSTALL_DIR" -a -n "$INSTALL_VER" ||
+-  fail "Configuration file $config not complete"
+ MODULE_SRC="$INSTALL_DIR/src/vboxguest-$INSTALL_VER"
+ BUILDINTMP="$MODULE_SRC/build_in_tmp"
+ 
+@@ -209,236 +201,17 @@
+     return 0
+ }
+ 
+-## Update the initramfs.  Debian and Ubuntu put the graphics driver in, and
+-# need the touch(1) command below.  Everyone else that I checked just need
+-# the right module alias file from depmod(1) and only use the initramfs to
+-# load the root filesystem, not the boot splash.  update-initramfs works
+-# for the first two and dracut for every one else I checked.  We are only
+-# interested in distributions recent enough to use the KMS vboxvideo driver.
+-update_initramfs()
+-{
+-    ## kernel version to update for.
+-    version="${1}"
+-    depmod "${version}"
+-    rm -f "/lib/modules/${version}/initrd/vboxvideo"
+-    test ! -d "/lib/modules/${version}/initrd" ||
+-        test ! -f "/lib/modules/${version}/misc/vboxvideo.ko" ||
+-        touch "/lib/modules/${version}/initrd/vboxvideo"
+-
+-    # Systems without systemd-inhibit probably don't need their initramfs
+-    # rebuild here anyway.
+-    type systemd-inhibit >/dev/null 2>&1 || return
+-    if type dracut >/dev/null 2>&1; then
+-        systemd-inhibit --why="Installing VirtualBox Guest Additions" \
+-            dracut -f --kver "${version}"
+-    elif type update-initramfs >/dev/null 2>&1; then
+-        systemd-inhibit --why="Installing VirtualBox Guest Additions" \
+-            update-initramfs -u -k "${version}"
+-    fi
+-}
+-
+ # Remove any existing VirtualBox guest kernel modules from the disk, but not
+ # from the kernel as they may still be in use
+ cleanup_modules()
+ {
+-    # Needed for Ubuntu and Debian, see update_initramfs
+-    rm -f /lib/modules/*/initrd/vboxvideo
+-    for i in /lib/modules/*/misc; do
+-        KERN_VER="${i%/misc}"
+-        KERN_VER="${KERN_VER#/lib/modules/}"
+-        unset do_update
+-        for j in ${OLDMODULES}; do
+-            test -f "${i}/${j}.ko" && do_update=1 && rm -f "${i}/${j}.ko"
+-        done
+-        test -z "$do_update" || update_initramfs "$KERN_VER"
+-        # Remove empty /lib/modules folders which may have been kept around
+-        rmdir -p "${i}" 2>/dev/null || true
+-        unset keep
+-        for j in /lib/modules/"${KERN_VER}"/*; do
+-            name="${j##*/}"
+-            test -d "${name}" || test "${name%%.*}" != modules && keep=1
+-        done
+-        if test -z "${keep}"; then
+-            rm -rf /lib/modules/"${KERN_VER}"
+-            rm -f /boot/initrd.img-"${KERN_VER}"
+-        fi
+-    done
+-    for i in ${OLDMODULES}; do
+-        # We no longer support DKMS, remove any leftovers.
+-        rm -rf "/var/lib/dkms/${i}"*
+-    done
+-    rm -f /etc/depmod.d/vboxvideo-upstream.conf
+-    rm -f "$SKIPFILE_BASE"-*
+-}
+-
+-# Build and install the VirtualBox guest kernel modules
+-setup_modules()
+-{
+-    KERN_VER="$1"
+-    test -n "$KERN_VER" || return 1
+-    # Match (at least): vboxguest.o; vboxguest.ko; vboxguest.ko.xz
+-    set /lib/modules/"$KERN_VER"/misc/vboxguest.*o*
+-    test ! -f "$1" || return 0
+-    test -d /lib/modules/"$KERN_VER"/build || return 0
+-    export KERN_VER
+-    info "Building the modules for kernel $KERN_VER."
+-
+-    log "Building the main Guest Additions $INSTALL_VER module for kernel $KERN_VER."
+-    if ! myerr=`$BUILDINTMP \
+-        --save-module-symvers /tmp/vboxguest-Module.symvers \
+-        --module-source $MODULE_SRC/vboxguest \
+-        --no-print-directory install 2>&1`; then
+-        # If check_module_dependencies.sh fails it prints a message itself.
+-        module_build_log "$myerr"
+-        "${INSTALL_DIR}"/other/check_module_dependencies.sh 2>&1 &&
+-            info "Look at $LOG to find out what went wrong"
+-        return 0
+-    fi
+-    log "Building the shared folder support module."
+-    if ! myerr=`$BUILDINTMP \
+-        --use-module-symvers /tmp/vboxguest-Module.symvers \
+-        --module-source $MODULE_SRC/vboxsf \
+-        --no-print-directory install 2>&1`; then
+-        module_build_log "$myerr"
+-        info  "Look at $LOG to find out what went wrong"
+-        return 0
+-    fi
+-    log "Building the graphics driver module."
+-    if ! myerr=`$BUILDINTMP \
+-        --use-module-symvers /tmp/vboxguest-Module.symvers \
+-        --module-source $MODULE_SRC/vboxvideo \
+-        --no-print-directory install 2>&1`; then
+-        module_build_log "$myerr"
+-        info "Look at $LOG to find out what went wrong"
+-    fi
+-    [ -d /etc/depmod.d ] || mkdir /etc/depmod.d
+-    echo "override vboxguest * misc" > /etc/depmod.d/vboxvideo-upstream.conf
+-    echo "override vboxsf * misc" >> /etc/depmod.d/vboxvideo-upstream.conf
+-    echo "override vboxvideo * misc" >> /etc/depmod.d/vboxvideo-upstream.conf
+-    update_initramfs "${KERN_VER}"
+-    return 0
+-}
+-
+-create_vbox_user()
+-{
+-    # This is the LSB version of useradd and should work on recent
+-    # distributions
+-    useradd -d /var/run/vboxadd -g 1 -r -s /bin/false vboxadd >/dev/null 2>&1 || true
+-    # And for the others, we choose a UID ourselves
+-    useradd -d /var/run/vboxadd -g 1 -u 501 -o -s /bin/false vboxadd >/dev/null 2>&1 || true
+-
+-}
+-
+-create_udev_rule()
+-{
+-    # Create udev description file
+-    if [ -d /etc/udev/rules.d ]; then
+-        udev_call=""
+-        udev_app=`which udevadm 2> /dev/null`
+-        if [ $? -eq 0 ]; then
+-            udev_call="${udev_app} version 2> /dev/null"
+-        else
+-            udev_app=`which udevinfo 2> /dev/null`
+-            if [ $? -eq 0 ]; then
+-                udev_call="${udev_app} -V 2> /dev/null"
+-            fi
+-        fi
+-        udev_fix="="
+-        if [ "${udev_call}" != "" ]; then
+-            udev_out=`${udev_call}`
+-            udev_ver=`expr "$udev_out" : '[^0-9]*\([0-9]*\)'`
+-            if [ "$udev_ver" = "" -o "$udev_ver" -lt 55 ]; then
+-               udev_fix=""
+-            fi
+-        fi
+-        ## @todo 60-vboxadd.rules -> 60-vboxguest.rules ?
+-        echo "KERNEL=${udev_fix}\"vboxguest\", NAME=\"vboxguest\", OWNER=\"vboxadd\", MODE=\"0660\"" > /etc/udev/rules.d/60-vboxadd.rules
+-        echo "KERNEL=${udev_fix}\"vboxuser\", NAME=\"vboxuser\", OWNER=\"vboxadd\", MODE=\"0666\"" >> /etc/udev/rules.d/60-vboxadd.rules
+-        # Make sure the new rule is noticed.
+-        udevadm control --reload >/dev/null 2>&1 || true
+-        udevcontrol reload_rules >/dev/null 2>&1 || true
+-    fi
+-}
+-
+-create_module_rebuild_script()
+-{
+-    # And a post-installation script for rebuilding modules when a new kernel
+-    # is installed.
+-    mkdir -p /etc/kernel/postinst.d /etc/kernel/prerm.d
+-    cat << EOF > /etc/kernel/postinst.d/vboxadd
+-#!/bin/sh
+-# This only works correctly on Debian derivatives - Red Hat calls it before
+-# installing the right header files.
+-/sbin/rcvboxadd quicksetup "\${1}"
+-exit 0
+-EOF
+-    cat << EOF > /etc/kernel/prerm.d/vboxadd
+-#!/bin/sh
+-for i in ${OLDMODULES}; do rm -f /lib/modules/"\${1}"/misc/"\${i}".ko; done
+-rmdir -p /lib/modules/"\$1"/misc 2>/dev/null || true
+-exit 0
+-EOF
+-    chmod 0755 /etc/kernel/postinst.d/vboxadd /etc/kernel/prerm.d/vboxadd
+-}
+-
+-shared_folder_setup()
+-{
+-    # Add a group "vboxsf" for Shared Folders access
+-    # All users which want to access the auto-mounted Shared Folders have to
+-    # be added to this group.
+-    groupadd -r -f vboxsf >/dev/null 2>&1
+-
+-    # Put the mount.vboxsf mount helper in the right place.
+-    ## @todo It would be nicer if the kernel module just parsed parameters
+-    # itself instead of needing a separate binary to do that.
+-    ln -sf "${INSTALL_DIR}/other/mount.vboxsf" /sbin
+-    # SELinux security context for the mount helper.
+-    if test -e /etc/selinux/config; then
+-        # This is correct.  semanage maps this to the real path, and it aborts
+-        # with an error, telling you what you should have typed, if you specify
+-        # the real path.  The "chcon" is there as a back-up for old guests.
+-        command -v semanage > /dev/null &&
+-            semanage fcontext -a -t mount_exec_t "${INSTALL_DIR}/other/mount.vboxsf"
+-        chcon -t mount_exec_t "${INSTALL_DIR}/other/mount.vboxsf" 2>/dev/null
+-    fi
++-    echo "Not implemented! Please use removepkg or pkgtool to remove virtualbox-addons and/or virtualbox-kernel-addons instead."
+ }
+ 
+ # setup_script
+ setup()
+ {
+-    # chcon is needed on old Fedora/Redhat systems.  No one remembers which.
+-    test ! -e /etc/selinux/config ||
+-        chcon -t bin_t "$BUILDINTMP" 2>/dev/null
+-
+-    if test -z "$INSTALL_NO_MODULE_BUILDS"; then
+-        info "Building the VirtualBox Guest Additions kernel modules.  This may take a while."
+-        info "To build modules for other installed kernels, run"
+-        info "  /sbin/rcvboxadd quicksetup <version>"
+-        info "or"
+-        info "  /sbin/rcvboxadd quicksetup all"
+-        if test -d /lib/modules/"$TARGET_VER"/build; then
+-            setup_modules "$TARGET_VER"
+-            depmod
+-        else
+-            info "Kernel headers not found for target kernel $TARGET_VER. \
+-Please install them and execute
+-  /sbin/rcvboxadd setup"
+-        fi
+-    fi
+-    create_vbox_user
+-    create_udev_rule
+-    test -n "${INSTALL_NO_MODULE_BUILDS}" || create_module_rebuild_script
+-    shared_folder_setup
+-    if  running_vboxguest || running_vboxadd; then
+-        info "Running kernel modules will not be replaced until the system is restarted"
+-    fi
+-
+-    # Put the X.Org driver in place.  This is harmless if it is not needed.
+-    # Also set up the OpenGL library.
+-    myerr=`"${INSTALL_DIR}/init/vboxadd-x11" setup 2>&1`
+-    test -z "${myerr}" || log "${myerr}"
+-
+-    return 0
++    echo "Not implemented! Please use the virtualbox-kernel-addons.SlackBuild available at SlackBuilds.org instead."
+ }
+ 
+ # cleanup_script
